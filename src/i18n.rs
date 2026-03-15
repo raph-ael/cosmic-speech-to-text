@@ -27,3 +27,15 @@ pub static LANGUAGE_LOADER: LazyLock<FluentLanguageLoader> = LazyLock::new(|| {
         .expect("Error while loading fallback language");
     loader
 });
+
+/// Convenience macro for localized strings.
+/// Usage: fl!("key") or fl!("key", arg = "value")
+#[macro_export]
+macro_rules! fl {
+    ($message_id:literal) => {{
+        i18n_embed_fl::fl!($crate::i18n::LANGUAGE_LOADER, $message_id)
+    }};
+    ($message_id:literal, $($arg:ident = $value:expr),+ $(,)?) => {{
+        i18n_embed_fl::fl!($crate::i18n::LANGUAGE_LOADER, $message_id, $($arg = $value),+)
+    }};
+}

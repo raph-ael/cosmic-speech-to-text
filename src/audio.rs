@@ -4,21 +4,40 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+/// Pre-initialized recorder that keeps the audio device ready.
 pub struct Recorder {
     recording: Arc<Mutex<bool>>,
     audio_file: Arc<Mutex<Option<PathBuf>>>,
+    // Pre-cached device info to avoid init delay on record start
+    sample_rate: u32,
+    channels: u16,
 }
 
 impl Recorder {
     pub fn new() -> Self {
+        // Pre-initialize audio device at startup
+        let host = cpal::default_host();
+        let (sample_rate, channels) =
+            if let Some(device) = host.default_input_device() {
+                let name = device.name().unwrap_or_default();
+                if let Ok(config) = device.default_input_config() {
+                    let sr = config.sample_rate().0;
+                    let ch = config.channels() as u16;
+                    eprintln!("Audio device pre-initialized: {name} ({sr}Hz, {ch}ch)");
+                    (sr, ch)
+                } else {
+                    (48000, 1)
+                }
+            } else {
+                (48000, 1)
+            };
+
         Self {
             recording: Arc::new(Mutex::new(false)),
             audio_file: Arc::new(Mutex::new(None)),
+            sample_rate,
+            channels,
         }
-    }
-
-    pub fn is_recording(&self) -> bool {
-        *self.recording.lock().unwrap()
     }
 
     pub fn start_recording(&self) {
@@ -31,9 +50,11 @@ impl Recorder {
 
         let recording = Arc::clone(&self.recording);
         let audio_file = Arc::clone(&self.audio_file);
+        let sample_rate = self.sample_rate;
+        let channels = self.channels;
 
         std::thread::spawn(move || {
-            if let Err(e) = record_audio(recording, audio_file) {
+            if let Err(e) = record_audio(recording, audio_file, sample_rate, channels) {
                 eprintln!("Recording error: {e}");
             }
         });
@@ -47,7 +68,7 @@ impl Recorder {
             }
             *rec = false;
         }
-        // Give the recording thread time to finalize
+        // Give the recording thread time to finalize the WAV
         std::thread::sleep(std::time::Duration::from_millis(200));
         self.audio_file.lock().unwrap().take()
     }
@@ -56,13 +77,13 @@ impl Recorder {
 fn record_audio(
     recording: Arc<Mutex<bool>>,
     audio_file: Arc<Mutex<Option<PathBuf>>>,
+    _expected_sample_rate: u32,
+    _expected_channels: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
         .ok_or("No input device available")?;
-
-    eprintln!("Using audio device: {}", device.name().unwrap_or_default());
 
     let supported_config = device.default_input_config()?;
     let sample_rate = supported_config.sample_rate().0;

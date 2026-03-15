@@ -1,9 +1,14 @@
 use crate::audio::{self, Recorder};
 use crate::config;
+use crate::deps;
+use crate::fl;
 use crate::paste;
+use crate::shortcut;
+use crate::toggle;
 use crate::transcribe;
 
 use cosmic::iced::window::Id;
+use cosmic::iced::Subscription;
 use cosmic::iced_winit::commands::popup::{destroy_popup, get_popup};
 use cosmic::prelude::*;
 use cosmic::widget;
@@ -20,8 +25,8 @@ pub struct AppModel {
     popup: Option<Id>,
     state: AppState,
     config: config::Config,
-    api_key_input: String,
     status_text: String,
+    missing_deps: Vec<(&'static str, &'static str)>,
     recorder: Recorder,
 }
 
@@ -30,9 +35,19 @@ pub enum Message {
     TogglePopup,
     PopupClosed(Id),
     ToggleRecording,
-    ApiKeyChanged(String),
-    SaveConfig,
+    OpenSettings,
+    CheckToggle,
     TranscriptionDone(Result<String, String>),
+}
+
+fn idle_status(missing: &[(&str, &str)], config: &config::Config) -> String {
+    if !missing.is_empty() {
+        deps::format_missing_i18n(missing)
+    } else if !config.is_configured() {
+        fl!("status-not-configured")
+    } else {
+        fl!("status-ready")
+    }
 }
 
 impl cosmic::Application for AppModel {
@@ -54,15 +69,25 @@ impl cosmic::Application for AppModel {
         core: cosmic::Core,
         _flags: Self::Flags,
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
-        let cfg = config::load_config();
-        let api_key_input = cfg.api_key.clone();
+        let mut cfg = config::load_config();
+
+        // Sync config hotkey with actual registered shortcut
+        if let Some(current) = shortcut::find_our_shortcut() {
+            if cfg.hotkey != current {
+                cfg.hotkey = current;
+                config::save_config(&cfg);
+            }
+        }
+
+        let missing = deps::check_missing();
+        let status = idle_status(&missing, &cfg);
         let app = AppModel {
             core,
             popup: None,
             state: AppState::Idle,
             config: cfg,
-            api_key_input,
-            status_text: "Ready".to_string(),
+            status_text: status,
+            missing_deps: missing,
             recorder: Recorder::new(),
         };
         (app, Task::none())
@@ -70,6 +95,11 @@ impl cosmic::Application for AppModel {
 
     fn on_close_requested(&self, id: Id) -> Option<Message> {
         Some(Message::PopupClosed(id))
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        cosmic::iced::time::every(std::time::Duration::from_millis(50))
+            .map(|_| Message::CheckToggle)
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -87,11 +117,10 @@ impl cosmic::Application for AppModel {
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
-        // Record toggle button
         let record_label = match self.state {
-            AppState::Idle => "Start Recording",
-            AppState::Recording => "Stop Recording",
-            AppState::Processing => "Processing...",
+            AppState::Idle => fl!("start-recording"),
+            AppState::Recording => fl!("stop-recording"),
+            AppState::Processing => fl!("processing"),
         };
 
         let record_icon = match self.state {
@@ -114,51 +143,44 @@ impl cosmic::Application for AppModel {
             record_btn
         };
 
-        // API Key input
-        let api_key_row = widget::column::with_children(vec![
-            widget::text("Mistral API Key").size(12).into(),
-            widget::text_input("Enter API key...", &self.api_key_input)
-                .on_input(Message::ApiKeyChanged)
-                .password()
-                .size(14)
-                .into(),
-        ])
-        .spacing(4);
-
-        // Save button
-        let save_btn = cosmic::applet::menu_button(
+        let settings_btn = cosmic::applet::menu_button(
             widget::row::with_children(vec![
-                widget::icon::from_name("document-save-symbolic")
+                widget::icon::from_name("emblem-system-symbolic")
                     .size(16)
                     .icon()
                     .into(),
-                widget::text("Save API Key").size(14).into(),
+                widget::text(fl!("settings")).size(14).into(),
             ])
             .spacing(8),
         )
-        .on_press(Message::SaveConfig);
+        .on_press(Message::OpenSettings);
 
-        // Hotkey display
         let hotkey_text =
-            widget::text(format!("Hotkey: {}", self.config.hotkey)).size(12);
+            widget::text(fl!("hotkey", hotkey = self.config.hotkey.as_str())).size(12);
 
-        // Status
         let status_text =
-            widget::text(format!("Status: {}", self.status_text)).size(12);
+            widget::text(fl!("status", status = self.status_text.as_str())).size(12);
 
-        let content = widget::column::with_children(vec![
-            record_btn.into(),
-            widget::divider::horizontal::default().into(),
-            api_key_row.into(),
-            save_btn.into(),
-            widget::divider::horizontal::default().into(),
-            hotkey_text.into(),
-            status_text.into(),
-        ])
-        .spacing(4);
+        let mut items: Vec<Element<'_, Self::Message>> = Vec::new();
+
+        if !self.missing_deps.is_empty() {
+            let warning = widget::text(deps::format_missing_i18n(&self.missing_deps)).size(12);
+            items.push(warning.into());
+            items.push(widget::divider::horizontal::default().into());
+        }
+
+        items.push(record_btn.into());
+        items.push(widget::divider::horizontal::default().into());
+        items.push(settings_btn.into());
+        items.push(widget::divider::horizontal::default().into());
+        items.push(hotkey_text.into());
+        items.push(status_text.into());
+
+        let content = widget::column::with_children(items).spacing(4);
 
         let cosmic = self.core.system_theme().cosmic();
-        let pad = cosmic::iced::Padding::from([cosmic.space_xxs() as u16, cosmic.space_xs() as u16]);
+        let pad =
+            cosmic::iced::Padding::from([cosmic.space_xxs() as u16, cosmic.space_xs() as u16]);
 
         self.core
             .applet
@@ -168,10 +190,22 @@ impl cosmic::Application for AppModel {
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
+            Message::CheckToggle => {
+                if toggle::check_toggle() {
+                    return self.update(Message::ToggleRecording);
+                }
+            }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
                     destroy_popup(p)
                 } else {
+                    self.config = config::load_config();
+                    self.missing_deps = deps::check_missing();
+                    if self.state == AppState::Idle {
+                        self.status_text =
+                            idle_status(&self.missing_deps, &self.config);
+                    }
+
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
                     let popup_settings = self.core.applet.get_popup_settings(
@@ -189,67 +223,95 @@ impl cosmic::Application for AppModel {
                     self.popup = None;
                 }
             }
-            Message::ToggleRecording => {
-                match self.state {
-                    AppState::Idle => {
-                        if self.config.api_key.is_empty() {
-                            self.status_text = "Set API key first!".to_string();
-                            return Task::none();
-                        }
-                        self.recorder.start_recording();
-                        self.state = AppState::Recording;
-                        self.status_text = "Recording...".to_string();
-                    }
-                    AppState::Recording => {
-                        self.state = AppState::Processing;
-                        self.status_text = "Transcribing...".to_string();
-
-                        let wav_path = self.recorder.stop_recording();
-                        let api_key = self.config.api_key.clone();
-
-                        return Task::perform(
-                            async move {
-                                let Some(wav) = wav_path else {
-                                    return Err("No audio file recorded".to_string());
-                                };
-
-                                let mp3 = audio::convert_to_mp3(&wav)
-                                    .map_err(|e| {
-                                        audio::cleanup_temp_files(&[&wav]);
-                                        e
-                                    })?;
-
-                                let result =
-                                    transcribe::transcribe_mistral(&mp3, &api_key).await;
-
-                                audio::cleanup_temp_files(&[&wav, &mp3]);
-                                result
-                            },
-                            |result| cosmic::Action::App(Message::TranscriptionDone(result)),
-                        );
-                    }
-                    AppState::Processing => {}
+            Message::OpenSettings => {
+                let _ = std::process::Command::new("cosmic-speech-to-text")
+                    .arg("--settings")
+                    .spawn();
+                if let Some(p) = self.popup.take() {
+                    return destroy_popup(p);
                 }
             }
-            Message::ApiKeyChanged(key) => {
-                self.api_key_input = key;
-            }
-            Message::SaveConfig => {
-                self.config.api_key = self.api_key_input.clone();
-                config::save_config(&self.config);
-                self.status_text = "API key saved".to_string();
-            }
+            Message::ToggleRecording => match self.state {
+                AppState::Idle => {
+                    self.config = config::load_config();
+                    let missing = deps::check_missing();
+                    if !missing.is_empty() {
+                        self.missing_deps = missing.clone();
+                        self.status_text = deps::format_missing_i18n(&missing);
+                        return Task::none();
+                    }
+                    if !self.config.is_configured() {
+                        self.status_text = fl!("status-set-api-key");
+                        return Task::none();
+                    }
+                    self.recorder.start_recording();
+                    self.state = AppState::Recording;
+                    self.status_text = fl!("status-recording");
+                }
+                AppState::Recording => {
+                    self.state = AppState::Processing;
+                    self.status_text = fl!("status-transcribing");
+
+                    let wav_path = self.recorder.stop_recording();
+                    let cfg = self.config.clone();
+
+                    return Task::perform(
+                        async move {
+                            let Some(wav) = wav_path else {
+                                return Err("No audio file recorded".to_string());
+                            };
+
+                            let mp3 = audio::convert_to_mp3(&wav).map_err(|e| {
+                                audio::cleanup_temp_files(&[&wav]);
+                                e
+                            })?;
+
+                            let result = transcribe::transcribe(
+                                &mp3,
+                                &wav,
+                                &cfg.mode,
+                                cfg.active_api_key(),
+                                &cfg.whisper_cpp_path,
+                                &cfg.whisper_model_path,
+                            )
+                            .await;
+
+                            audio::cleanup_temp_files(&[&wav, &mp3]);
+                            result
+                        },
+                        |result| cosmic::Action::App(Message::TranscriptionDone(result)),
+                    );
+                }
+                AppState::Processing => {}
+            },
             Message::TranscriptionDone(result) => {
                 match result {
                     Ok(text) => {
-                        self.status_text = format!("Done: {}...", &text[..text.len().min(30)]);
-                        if let Err(e) = paste::paste_text(&text) {
-                            eprintln!("Paste error: {e}");
-                            self.status_text = format!("Transcribed but paste failed: {e}");
+                        let preview = &text[..text.len().min(30)];
+                        self.status_text = fl!("status-done", text = preview);
+
+                        let close_task = if let Some(p) = self.popup.take() {
+                            Some(destroy_popup(p))
+                        } else {
+                            None
+                        };
+
+                        let text_clone = text.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            if let Err(e) = paste::paste_text(&text_clone) {
+                                eprintln!("Paste error: {e}");
+                            }
+                        });
+
+                        self.state = AppState::Idle;
+                        if let Some(task) = close_task {
+                            return task;
                         }
+                        return Task::none();
                     }
                     Err(e) => {
-                        self.status_text = format!("Error: {e}");
+                        self.status_text = fl!("status-error", error = e.as_str());
                         eprintln!("Transcription error: {e}");
                     }
                 }
