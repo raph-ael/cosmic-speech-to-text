@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Speech to Text
+Comment=Speech-to-text transcription from the COSMIC panel
+Type=Application
+Icon=io.github.cosmic-speech-to-text
+Exec=cosmic-speech-to-text %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC;Audio;
+Keywords=COSMIC;Speech;Transcription;
+X-CosmicApplet=true
+NoDisplay=true
